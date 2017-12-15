@@ -1,184 +1,399 @@
 #lang racket
 
-; by Tal Davidi
-
 (provide desugar)
+
 (require "utils.rkt")
 
-;Output language:
 
-;e ::= (let ([x e] ...) e)
-;    | (lambda (x ...) e)
-;    | (lambda x e)
-;    | (apply e e)
-;    | (e e ...)
-;    | (prim op e ...) 
-;    | (apply-prim op e)
-;    | (if e e e)
-;    | (set! x e)
-;    | (call/cc e)
-;    | x
-;    | (quote dat)
 
-(define (desugar-conds cond-list)
-  (match cond-list
-    ['() `(prim void)]
-    [(cons `(,e1) rest) (define temp (gensym 'temp)) `(let ((,temp ,(desugar-aux e1))) (if ,temp ,temp ,(desugar-conds rest)))]
-    [(cons `(else ,e1) rest) (desugar-aux e1)] ;else must be in tail position (ignore rest)
-    [(cons `(,e1 ,e2) rest) `(if ,(desugar-aux e1) ,(desugar-aux e2) ,(desugar-conds rest))]
-    ))
+(define (prefix x)
+  (if (equal? "$" (substring (symbol->string x) 0 1))
+      x
+      (string->symbol (string-append "$" (symbol->string x)))))
 
-(define (desugar-cases case-list temp-name)
-  (match case-list
-    [(cons `((,d ...) ,e1) rest) `(if (prim member ,temp-name ,(list 'quote d)) ,(desugar-aux e1) ,(desugar-cases rest temp-name))]
-    [(cons `(else ,e1) '()) (desugar-aux e1)]
-    ['() `(prim void)]
-    ))
+(define (ext-env h xs0 xs1)
+  (foldl (lambda (x y h) (hash-set h x y)) h xs0 xs1))
 
-(define (desugar-aux e)
+(define (t-letrec* e env)
   (match e
-    [`(letrec* ([,xs ,e0s] ...) ,e1)
-     (define temp_list (map gensym xs)) ;generate temp list of symbols
-     (define let_body (foldr (lambda (x e0 temp acc) `(let ((,temp ,(desugar-aux e0))) (let ((,(gensym 'side) (set! ,x ,temp))) ,acc))) (desugar-aux e1) xs e0s temp_list))
-     `(let ,(map (lambda (x) `(,x 'undefined)) xs) ,let_body)] ;set outer shell to be all undefined variables
-    [`(letrec ([,xs ,e0s] ...) ,e1)
-     (define temp_list (map gensym xs)) ;generate temp list of symbols
-     `(let ,(map (lambda (x) `(,x 'undefined)) xs) (let ,(map (lambda (e0 temp) `(,temp ,(desugar-aux e0))) e0s temp_list) ,(desugar-aux (append (cons 'begin (map (lambda (x temp) `(set! ,x ,temp)) xs temp_list)) `(,e1)))))] ;set outer shell to be all undefined variables
-    [`(let* ([,xs ,e0s] ...) ,e1)
-     (foldr (lambda (x e0 acc) `(let ((,x ,(desugar-aux e0))) ,acc)) (desugar-aux e1) xs e0s)]
-    [`(let ([,xs ,e0s] ...) ,body)
-     `(let ,(map (lambda (var exp) `(,var ,(desugar-aux exp))) xs e0s) ,(desugar-aux body))]
-    [`(let ,x ([,xs ,e0s] ...) ,e1)
-     (desugar-aux `(letrec ([,x (lambda ,xs ,e1)]) (,x . ,e0s)))]
-    [`(lambda (,xs ...) ,e)
-     `(lambda ,xs ,(desugar-aux e))]
-    [`(lambda ,(? symbol? x) ,e)
-     `(lambda ,x ,(desugar-aux e))]
-    [`(lambda ,(list-rest x ... opt_list) ,e1)
-     (define cdr_list (foldl (lambda (x acc) (cons `(prim cdr ,(car acc)) acc)) (cons 'x '()) (cdr x)))
-     (define car_list (map (lambda (x) `(prim car ,x)) cdr_list))
-     (define rev_car (reverse car_list))
-     (define opt_cdr `(prim cdr ,(car cdr_list)))
-     `(lambda x (let ,(cons `(,opt_list ,opt_cdr) (map (lambda (x car) `(,x ,car)) x rev_car)) ,(desugar-aux e1)))]
-    [`(dynamic-wind ,start ,body ,end)
-     `(%dynamic-wind ,(desugar-aux start) ,(desugar-aux body) ,(desugar-aux end))]
-    [`(guard (,x ,cond-clause ...) ,e1)
-     (desugar-aux `(let ([cc (call/cc (lambda (k) k))])
-                     (if (cons? cc)
-                         (let ((,x (car cc))) (cond . ,(append cond-clause `((else (raise ,x))))))
-                         (dynamic-wind
-                          (lambda () (begin (set! %handler-stack (cons %exception-handler %handler-stack)) (set! %exception-handler cc)));setup-new-handler
-                          (lambda () ,e1)
-                          (lambda () (begin (set! %exception-handler (car %handler-stack)) (set! %handler-stack (cdr %handler-stack)))) ;revert to old handler
-                          ))))]
-    [`(raise ,e1)
-     `(%exception-handler (prim cons ,(desugar-aux e1) '()))]
-    [`(delay ,e1)
-     `(prim list 'promise-tag (lambda () ,(desugar-aux e1)) (prim make-vector '1 'unresolved-tag))]
-    [`(force ,e1)
-     `(let ((prom  ,(desugar-aux e1)))
-        (if ,(desugar-aux '(promise? prom))
-            (let ((val
-                   (prim vector-ref (prim car (prim cdr (prim cdr prom))) '0)))
-              (if (prim equal? val 'unresolved-tag)
-                  (let ([new-val ((prim car (prim cdr prom)))])
-                    (let ((,(gensym 'side) (prim vector-set! (prim car (prim cdr (prim cdr prom))) '0 new-val)))
-                      new-val))
-                  val)
-              )
-            prom))]
-    [`(and) ''#t]
-    [`(and ,e0s ...)
-     (define rev (reverse e0s))
-     (define last-exp (car rev))
-     (foldl (lambda (e0 acc) `(if ,(desugar-aux e0) ,acc '#f)) `(let ((exp ,(desugar-aux last-exp))) (if exp exp '#f)) (cdr rev))]
-    [`(or ,e0s ...)
-     (foldr (lambda (e0 acc) `(let ((val ,(desugar-aux e0))) (if val val ,acc))) ''#f e0s)]
-    [`(cond ,cond-clause ...)
-     (desugar-conds cond-clause)]
-    [`(case ,e0 ,case-clause ...)
-     (define temp (gensym 'temp))
-     `(let ((,temp ,(desugar-aux e0))) ,(desugar-cases case-clause temp))]
-    [`(if ,e1 ,e2 ,e3)
-     `(if ,(desugar-aux e1) ,(desugar-aux e2) ,(desugar-aux e3))]
-    [`(when ,e1 ,e2)
-     `(if ,(desugar-aux e1) ,(desugar-aux e2) (prim void))]
-    [`(unless ,e1 ,e2)
-     `(if ,(desugar-aux e1) (prim void) ,(desugar-aux e2))]
-    [`(set! ,x ,e1)
-     `(set! ,x ,(desugar-aux e1))]
-    [`(begin ,e0s ...)
-     (define rev (reverse e0s))
-     (foldl (lambda (e0 acc) `(let ((,(gensym 'side) ,(desugar-aux e0))) ,acc)) (desugar-aux (car rev)) (cdr rev))]
-    [`(call/cc ,e1)
-     `(call/cc ,(desugar-aux `(lambda (k)
-                                (,e1  (let ([k-stack %wind-stack])
-                                        (lambda (x)
-                                          (begin (%do-wind k-stack)
-                                                 (k x))))))))]
-    [`(let/cc ,k ,body ...) (desugar-aux `(call/cc (lambda (,k) (begin ,body))))]
-    [`(apply ,(? prim? p) ,e2)
-     `(apply-prim ,p ,(desugar-aux e2))]
-    [`(apply ,e1 ,e2)
-     `(apply ,(desugar-aux e1) ,(desugar-aux e2))]
-    [`(promise? ,e0)
-     (desugar-aux `(let ([prom ,e0]) (if (cons? prom) (equal? 'promise-tag (car prom)) '#f)))]
-    [`(,(? prim? p) ,es ...)
-     `(prim ,p . ,(map desugar-aux es))]
-    [(? prim? p) `(lambda args (apply-prim ,p args))]
-    [`(quote ,(? datum? d)) e]
-    [(? symbol? x) x]
-    [`(,e1 ,e0s ...) ;untagged application
-     `(,(desugar-aux e1) . ,(map desugar-aux e0s))]
-    ))
+         [`(,xletrec* ([,xs ,es] ...) ,e0)
+          (t-desugar
+            `(%%let ,(map list xs (map (lambda (x) ''()) xs))
+               (%%begin
+                 ,@(map (lambda (x e) `(%%set! ,x ,e)) xs es)
+                 ,e0))
+            env)]))
+
+(define (t-letrec e env)
+  (match e  
+         [`(,xletrec ([,xs ,es] ...) ,e0)
+          (define ts (map (lambda (x) (gensym 'letrec)) xs))
+          (t-desugar
+            `(%%let ,(map list xs (map (lambda (x) ''()) xs))
+               (%%let ,(map list ts es)
+                 (%%begin
+                   ,@(map (lambda (x t) `(%%set! ,x ,t)) xs ts)
+                   ,e0)))
+            env)]))
+
+(define (t-let* e env)
+  (match e
+         [`(,xlet* () ,e0)
+          (t-desugar e0 env)]
+         [`(,_ ([,x ,e0] . ,rest) ,e1)
+          (t-desugar
+            `(%%let ([,x ,e0]) (%%let* ,rest ,e1))
+            env)]))
+
+(define (t-guard e env)
+  (match e
+         [`(,xguard (,x) ,e0)
+          (t-desugar e0 env)]
+         [`(,xguard (,x ,clauses ... [else ,eelse]) ,e0)
+          (t-desugar
+           `(%%let ([%old-handler %raise-handler])
+                   (%%let ((%cc (%%call/cc (%%lambda (k) k))))
+                          (%%cond [(%%prim procedure? %cc)
+                                   (%%dynamic-wind
+                                    (%%lambda () (%%set! %raise-handler (%%lambda (x) (%cc (%%prim cons x (%%quote ()))))))
+                                    (%%lambda () ,e0)
+                                    (%%lambda () (%%set! %raise-handler %old-handler)))]
+                                  [(%%prim cons? %cc)
+                                   (%%let ([,x (%%prim car %cc)])
+                                          (%%cond ,@clauses [else ,eelse]))])))
+           env)]
+         [`(,xguard (,x ,clauses ...) ,e0)
+          (t-desugar
+            `(%%guard (,x ,@clauses [else (%%raise ,x)]) ,e0)
+            env)]))
+
+(define (t-raise e env)
+  (match e
+         [`(,xraise ,e0)
+          (t-desugar
+           `(%raise-handler ,e0)
+           env)]))
+
+(define (t-call/cc e env)
+  (match e
+         [`(,xccc ,e0)
+          `(call/cc
+            ,(t-desugar
+              `(%%lambda (%k)
+                 (,e0 (%%let ([%saved-stack %wind-stack])
+                             (%%lambda (%x)
+                               (%%begin
+                                 (%%if (%%prim eq? %saved-stack %wind-stack)
+                                       (%%prim void)
+                                       (%do-wind %saved-stack))
+                                 (%k %x))))))
+              env))]))
+
+
+(define (t-let/cc e env)
+  (match e
+         [`(,xletcc ,x ,e0)
+          (t-desugar `(%%call/cc (%%lambda (,x) ,e0))
+                     env)]))
+
+
+(define (t-dynamic-wind e env)
+  (match e
+         [`(,xwind ,e0 ,e1 ,e2)
+          (t-desugar
+           `(%%let ([%pre ,e0] [%body ,e1] [%post ,e2])
+                   (%%begin (%pre)
+                            (%%set! %wind-stack (%%prim cons (%%prim cons %pre %post) %wind-stack))
+                            (%%let ([%v (%body)])
+                                   (%%begin (%%set! %wind-stack (%%prim cdr %wind-stack))
+                                            (%post)
+                                            %v))))
+           env)]))
+
+(define (t-delay e env)
+  (match e
+         [`(,xdelay ,e0)
+          (t-desugar
+           `(%%prim list (%%quote %%promise) (%%lambda () ,e0) (%%prim make-vector (%%quote 2) (%%quote #f)))
+           env)]))
+
+(define (t-force e env)
+  (match e
+         [`(,xforce ,e0)
+          (define t (gensym 'promise))
+          (define tt (gensym 'promise))
+          (t-desugar 
+            `(%%let ([,t ,e0])
+                    (%%if (promise? ,t)
+                          (%%if (%%prim eq? (%%quote %%promise) (%%prim car ,t))
+                                (%%if (%%prim vector-ref (%%prim third ,t) (%%quote 0))
+                                      (%%prim vector-ref (%%prim third ,t) (%%quote 1))
+                                      (%%let ([,tt ((%%prim second ,t))])
+                                             (%%begin (%%prim vector-set! (%%prim third ,t) (%%quote 0) (%%quote #t))
+                                                      (%%prim vector-set! (%%prim third ,t) (%%quote 1) ,tt)
+                                                      ,tt)))
+                                (%%raise (%%quote "value is not a promise")))
+                          ,t))
+            env)]))
+
+(define (t-cond e env)
+  (match e
+         [`(,xcond) (t-desugar `(%%prim void) env)]
+         [`(,xcond (else ,e0)  . ,rest) (t-desugar e0 env)]
+         [`(,xcond (,e0) . ,rest)
+          (define t0 (gensym 'cond))
+          (t-desugar
+            `(%%let ([,t0 ,e0])
+               (%%if ,t0
+                   ,t0
+                   (%%cond . ,rest)))
+            env)]
+         [`(,xcond (,e0 => ,e1) . ,rest)
+          (define t0 (gensym 'cond))
+          (t-desugar
+            `(%%let ([,t0 ,e0])
+               (%%if ,t0
+                   (,e1 ,t0)
+                   (%%cond . ,rest)))
+            env)]
+         [`(,xcond (,e0 ,e1) . ,rest)
+          (t-desugar
+            `(%%if ,e0 ,e1 (%%cond . ,rest))
+            env)]))
+
+(define (t-case e env)
+  (match e
+         [`(,xcase ,keye ,clauses ...)
+          #:when (not (symbol? keye))
+          (define t (gensym 'case-key))
+          (t-desugar `(%%let ([,t ,keye]) (%%case ,t . ,clauses))
+                     env)]
+         
+         [`(,xcase ,key) (t-desugar `(%%prim void) env)]
+         [`(,xcase ,key (else ,e0)  . ,rest) (t-desugar e0 env)]
+         [`(,xcase ,key ((,(? datum? ds) ...) ,e0) . ,rest)
+          (t-desugar
+           `(%%if (%%prim memv ,key (%%quote ,ds))
+                  ,e0
+                  (%%case ,key . ,rest))
+            env)]))
+
+(define (t-or e env)
+  (match e
+         [`(,xor) (t-desugar `(%%quote #f) env)]
+         [`(,xor ,e0) (t-desugar e0 env)]
+         [`(,xor ,e0 . ,es)
+          (define t (gensym 'or))
+          (t-desugar `(%%let ([,t ,e0]) (%%if ,t ,t (%%or . ,es)))
+                     env)]))
+
+(define (t-and e env)
+  (match e
+         [`(,xand) (t-desugar `(%%quote #t) env)]
+         [`(,xand ,e0) (t-desugar e0 env)]
+         [`(,xand ,e0 . ,es)
+          (t-desugar `(%%if ,e0 (%%and . ,es) (%%quote #f))
+                     env)]))
+
+(define (t-begin e env)
+  (match e
+         [`(,xbegin) (t-desugar `(%%prim void) env)]
+         [`(,xbegin ,e0) (t-desugar e0 env)]
+         [`(,xbegin ,e0 . ,es)
+          (t-desugar
+            `(%%let ([,(gensym '_) ,e0])
+               (%%begin . ,es))
+            env)]))
+
+(define (t-let e env)
+  (match e
+         [`(,xlet ([,xs ,es] ...) ,e0)
+          `(let ,(map (lambda (x e) `(,(prefix x) ,(t-desugar e env))) xs es)
+             ,(t-desugar e0 (ext-env env xs (map prefix xs))))]
+         
+         [`(,xlet ,loop ([,xs ,es] ...) ,e0)
+          (t-desugar
+           `(%%letrec* ([,loop (%%lambda ,xs ,e0)])
+                       (,loop . ,es))
+           env)]))
+
+(define (t-lambda e env)
+  (match e
+         [`(,xlambda (,(? symbol? xs) ...) ,e0)
+          `(lambda ,(map prefix xs) ,(t-desugar e0 (ext-env env xs (map prefix xs))))]
+         
+         [`(,xlambda ,(? symbol? x) ,e0)
+          `(lambda ,(prefix x) ,(t-desugar e0 (ext-env env (list x) (list (prefix x)))))]
+         
+         [`(,xlambda ,args ,e0)
+          (define al (flatten args))
+          (define xs (drop-right al 1))
+          (define y (last al))
+          (define tx (gensym 'vararg))
+          `(lambda ,tx
+             ,(t-desugar
+               `(%%let* ,(foldr (lambda (x binds) `([,x (car ,tx)] [,tx (cdr ,tx)] . ,binds))
+                              `([,y ,tx])
+                              xs)
+                  ,e0)
+               env))]))
+
+(define (t-apply e env)
+  (match e
+         [`(,xapply ,e0 ,e1)
+          `(apply ,(t-desugar e0 env)
+                  ,(t-desugar e1 env))]))
+
+(define (t-when e env)
+  (match e
+         [`(,xwhen ,e0 ,e1)
+          `(if ,(t-desugar e0 env)
+               ,(t-desugar e1 env)
+               (prim void))]))
+
+(define (t-unless e env)
+  (match e
+         [`(,xunless ,e0 ,e1)
+          `(if ,(t-desugar e0 env)
+               (prim void)
+               ,(t-desugar e1 env))]))
+
+(define (t-if e env)
+  (match e
+         [`(,xif ,e0 ,e1)
+          `(if ,(t-desugar e0 env)
+               ,(t-desugar e1 env)
+               (prim void))]
+         [`(,xif ,e0 ,e1 ,e2)
+          `(if ,(t-desugar e0 env)
+               ,(t-desugar e1 env)
+               ,(t-desugar e2 env))]))
+
+(define (t-set! e env)
+  (match e
+         [`(,xset! ,x ,e0)
+          `(set! ,(prefix x)
+                 ,(t-desugar e0 env))]))
+
+(define (t-quote e env)
+  (match e
+         [`(,xquote ,d)
+          `(quote ,d)]))
+
+(define (t-prim e env)
+  (match e
+         [`(,xprim ,op ,es ...)
+          `(prim ,op . ,(map (lambda (e) (t-desugar e env)) es))]))
+
+(define (t-apply-prim e env)
+  (match e
+         [`(,xapply-prim ,op ,es ...)
+          `(apply-prim ,op . ,(map (lambda (e) (t-desugar e env)) es))]))
+
+; The top level desugaring function
+; takes an e, env and either dispatches on the function in the env
+; or matches a symbol?, prim-op, or normal application
+(define (t-desugar e env)  ; (pretty-print `(t-desugar ,e ,env))
+  (match e
+         ; match a transformer in env
+         [`(,(? (lambda (x) (procedure? (hash-ref env x #f))) x) . ,rest)
+          ((hash-ref env x) e env)]
+
+         ; primitive (optimized case)
+         [`(,(? prim? op) ,es ...)
+          #:when (eq? #t (hash-ref env op #f))
+          (t-desugar `(%%prim ,op . ,es)
+                     env)]
+
+         ; optional renaming by the env
+         [(? symbol? x)
+          (define xx (hash-ref env x #f))
+          (match xx
+                 [#f x]
+                 [#t (t-desugar `(%%lambda args (%%apply-prim ,x args)) env)]
+                 [(? symbol?) xx]
+                 [(? procedure?)
+                  (error (format "variable ~a bound to transformer in environment" x))])]         
+
+         ; untagged application
+         [`(,es ...)
+          (map (lambda (e) (t-desugar e env)) es)]
+
+         [else (pretty-print `(bad-term ,e ,env))
+               (error 'bad-term)]))
+
 
 
 (define (desugar e)
-  ; wrap e in any special functions or definitions you need
-  ; and then pass it into a helper function that performs the
-  ; case-by-case translation recursively
-  (desugar-aux (wrap-with-lib e)))
-
-(define (wrap-with-lib e)
-    `(let* ([%wind-stack '()]
-            [common-tail (lambda (x y)
-                           (let ((lx (length x))
-                                 (ly (length y)))
-                             (let loop ([x (if (> lx ly) (drop x (- lx ly)) x)]
-                                        [y (if (> ly lx) (drop y (- ly lx)) y)])
-                               (if (eq? x y)
-                                   x
-                                   (loop (cdr x) (cdr y))))))]
+  (define (wrap e)
+    `(let* ([promise? (lambda (p) (and (cons? p) (eq? (car p) (quote %%promise))))]
+            [%raise-handler '()]
+            [%wind-stack '()]
+            [%common-tail (lambda (x y)
+                            (let ((lx (length x))
+                                  (ly (length y)))
+                              (let loop ([x (if (> lx ly) (drop x (- lx ly)) x)]
+                                         [y (if (> ly lx) (drop y (- ly lx)) y)])
+                                (if (eq? x y)
+                                    x
+                                    (loop (cdr x) (cdr y))))))]
             [%do-wind (lambda (new)
-                        (unless (eq? new %wind-stack) 
-                                (let ([tail (common-tail new %wind-stack)])
+                        (let ([tail (%common-tail new %wind-stack)])
+                          (begin
+                            (let f ((l %wind-stack))
+                              (if (not (eq? l tail))
                                   (begin
-                                    (let f ((l %wind-stack))
-                                      (unless (eq? l tail)
-                                              (begin
-                                                (set! %wind-stack (cdr l))
-                                                ((cdr (car l)))
-                                                (f (cdr l)))))
-                                    (let f ([l new])
-                                      (unless (eq? l tail)
-                                              (begin
-                                                (f (cdr l))
-                                                ((car (car l)))
-                                                (set! %wind-stack l))))))))]
-            [%dynamic-wind (lambda  (pre body post)
-                              (begin
-                                (pre)
-                                (set! %wind-stack (cons (cons pre post) %wind-stack))
-                                (let ([v (body)])
+                                    (set! %wind-stack (cdr l))
+                                    ((cdr (car l)))
+                                    (f (cdr l)))))
+                            (let f ([l new])
+                              (if (not (eq? l tail))
                                   (begin
-                                    (set! %wind-stack (cdr %wind-stack))
-                                    (post)
-                                    v))))]
-            [%exception-handler '()]
-            [%handler-stack '()])
+                                    (f (cdr l))
+                                    ((car (car l)))
+                                    (set! %wind-stack l)))))))])
            ,e))
+  
+  ; The environment starts with procedures for forms we desugar
+  (define reserved-env (hash
+                    'letrec* t-letrec* 
+                     'letrec t-letrec 
+                     'let* t-let* 
+                     'guard t-guard 
+                     'raise t-raise
+                     'dynamic-wind t-dynamic-wind
+                     'delay t-delay 
+                     'force t-force 
+                     'cond t-cond
+                     'case t-case
+                     'and t-and
+                     'or t-or
+                     'begin t-begin
+                     'let t-let
+                     'if t-if
+                     'when t-when
+                     'unless t-unless
+                     'lambda t-lambda
+                     'quote t-quote
+                     'apply t-apply
+                     'prim t-prim
+                     'call/cc t-call/cc
+                     'let/cc t-let/cc
+                     'apply-prim t-apply-prim
+                     'set! t-set!))
+  ; add a set of special aliases for the core forms we can use safely in desugaring
+  ; (a form like lambda or letrec can be shadowed)
+  (define aliases-env (foldl (lambda (k env) (hash-set env
+                                                       (string->symbol (string-append "%%" (symbol->string k)))
+                                                       (hash-ref env k)))
+                             reserved-env
+                             (hash-keys reserved-env)))
+  ; primitive operations start as #t and new (user) bindings are #f 
+  (define prims-env (foldl (lambda (p env) (hash-set env p #t))
+                           aliases-env
+                           (prims->list)))
+  (t-desugar (wrap e) prims-env))
 
 
 
-; I, Tal Davidi, pledge on my honor that I have not given or 
-; received any unauthorized assistance on this project.
+

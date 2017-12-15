@@ -1,5 +1,6 @@
 #lang racket
 
+;; project 5 utils.rkt
 
 (provide prim? reserved? prims->list
          c-name
@@ -25,7 +26,8 @@
          test-cps-convert
          proc-exp?
          test-closure-convert
-         test-proc->llvm)
+         test-proc->llvm
+         test-full)
 
 
 (define project-path (current-directory))
@@ -659,7 +661,16 @@
                              val val0))
         #f)))
 
-
+(define (test-full top-level desugar simplify-ir assignment-convert alphatize anf-convert cps-convert closure-convert proc->llvm prog)
+  (define val (eval-top-level prog))
+  (define llvm (proc->llvm (closure-convert (cps-convert (anf-convert (alphatize (assignment-convert (simplify-ir (desugar (top-level prog))))))))))
+  (define val0 (eval-llvm llvm))
+  (if (equal? val val0)
+      #t
+      (begin
+        (display (format "Test-proc->llvm: two different values (~a and ~a) before and after compilation.\n"
+                             val val0))
+        #f)))
 
 
 (define (racket-compile-eval e)
