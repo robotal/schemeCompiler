@@ -1,6 +1,7 @@
 # Scheme Compiler in racket
 #### By Tal Davidi
-___
+
+###### I, Tal Davidi, pledge on my honor that I have not given or received any unauthorized assistance on this assignment.
 
 # 1. Running the Compiler
 
@@ -10,17 +11,19 @@ Make sure you have at least _racket 6.10_ and _clang 3.9_ installed in order to 
 
 In order to make an executable file you must place the scheme file under the `tests/` directory
 in any of the subdirectories `public/`, `release/` or `secret/`. When running the command `racket tests.rkt` you should see the name of your program without the `.scm` ending.
-Running `racket tests.rkt [name]` will then compile the scheme file to an executable `bin` which can be run for output of the last expression in the program.
+Running `racket tests.rkt [name]` will then compile the scheme file to an executable `bin` and test if the value outputted is the same as when run by the scheme interpreter.
+
+Alternatively, you can use the `racket make.rkt` script provided to directly compile to a binary file and then run it without testing. This will allow you to see the output of your program if an error occurs. Run it using `racket make.rkt [-o outFile] fileName`. You can also display a help message using `racket make.rkt -h`.
 
 # 2. Overview
 
 The compiler itself is divided into 4 phases. Each phase simplifies the input language until it is trivial to convert to llvm which can then be compiled to a binary using clang.
 
 ### 1. top-level conversion
-The aim of top-level conversion is to take a generic program written in an iterative fashion and to convert it into a functional style by wrapping multiple expressions in `begin` statements and pulling `define` statements at the same level into a `let-rec` around the body.
+The aim of top-level conversion is to take a generic program written in an iterative fashion and to convert it into a functional style by wrapping multiple expressions in `begin` statements and pulling `define` statements at the same level into a `letrec` around the body.
 
 ### 2. desugar
-The next step removes many of the forms of the scheme language and simplifies them to a series of simpler operations. Some notable difficulties at this point are handling the interaction between `call/cc` and `dynamic-wind`, due to the fact that a continuation created under a `dynamic-wind` must restore any set-up or breakdown code which occurred at the time of creation of the continuation. Another one is how to encode promises using only primitive data structures and lambdas. This is done by creating a list
+The next step removes many of the forms of the scheme language and simplifies them to a series of simpler operations. Some notable difficulties at this point are handling the interaction between `call/cc` and `dynamic-wind`, due to the fact that a continuation created under a `dynamic-wind` must restore any set-up or breakdown code which occurred at the time of creation of the continuation. Another one is how to encode promises using only primitive data structures and lambdas. This is done by creating a list which holds a promise tag, the expression to evaluate, and a vector holding the return value after forcing the promise once.
 
 ### 3. assignment-convert, alphatize, anf-convert, cps-convert
 The next phase can be split into 4 smaller phases which prepare the input for the last phase, cps-conversion.
@@ -211,4 +214,25 @@ The next phase can be split into 4 smaller phases which prepare the input for th
 # 4. Run-time errors
 
 1. index out of bounds (vector)
+
 2. division by 0
+    When attempting to divide by 0, the compiler would normally just hang and infinite loop. After adding a check in header.cpp to `prim__47` it will now throw a division by zero error. The two tests `div0_1.scm` and `div0_2.scm` will both check for this.
+
+    ```
+    tal@Tals-MacBook-Pro$ cat tests/public/div0_1.scm
+    (define a 3)
+    (define b 0)
+    (/ a b)
+    tal@Tals-MacBook-Prot$ racket make.rkt -o div0_1 tests/public/div0_1.scm
+    tal@Tals-MacBook-Pro$ ./div0_1
+    library run-time error: Division by 0
+    ```
+
+    ```
+    tal@Tals-MacBook-Pro$ cat tests/public/div0_2.scm
+    (define b 10)
+    (map (lambda (a) (/ b a)) '(1 2 3 4 0))
+    tal@Tals-MacBook-Pro$ racket make.rkt -o div0_2 tests/public/div0_2.scm
+    tal@Tals-MacBook-Pro$ ./div0_2
+    library run-time error: Division by 0
+    ```
