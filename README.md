@@ -210,12 +210,44 @@ The next phase can be split into 4 smaller phases which prepare the input for th
      - method signature: (promise? p)
      - input types: p can be any value
      - behaviour: Returns true if p is a promise.
-
+ - **make-hash**
+     - method signature: (make-hash)
+     - input types: none
+     - behaviour: Returns a fresh mutable hash
+ - **hash-set!**
+     - method signature: (hash-set! h v v)
+     - input types: h must be a hash created with **make-hash** and v is any pair of key/values.
+     - behaviour: updates the hash table with a new entry for the given key value pair
+- **hash-ref**
+    - method signature: (hash-ref h v)
+    - input types: h must be a hash and v must be a value of a key in the hash
+    - behaviour: returns the value currently mapped in that hash, throws an exception if it does not exist.
 # 4. Run-time errors
 
 1. index out of bounds (vector)
 
+    When calling vector-ref on an index larger than the length, no checks are made to see if the index is out of bounds. This causes the header to attempt to access memory which is garbage. Adding a check in `prim_vector_45ref` will now throw index out of bounds error.
+
+    ```
+    tal@Tals-MacBook-Pro$ cat tests/public/vecBnds_0.scm
+    (define v (make-vector 3 'hola))
+    (vector-ref v 5)
+    tal@Tals-MacBook-Pro$ racket make.rkt -o vecBnds_0 tests/public/vecBnds_0.scm
+    tal@Tals-MacBook-Pro$ ./vecBnds_0
+    library run-time error: Index out of bounds, given index 5 for vector of length 3.
+    ```
+
+    ```
+    tal@Tals-MacBook-Pro$ cat tests/public/vecBnds_1.scm
+    (define v (vector 'hello 'world 5 'narwhals))
+    (vector-ref v 10)
+    tal@Tals-MacBook-Pro$ racket make.rkt -o vecBnds_1 tests/public/vecBnds_1.scm
+    tal@Tals-MacBook-Pro$ ./vecBnds_1
+    library run-time error: Index out of bounds, given index 10 for vector of length 4.
+    ```
+
 2. division by 0
+
     When attempting to divide by 0, the compiler would normally just hang and infinite loop. After adding a check in header.cpp to `prim__47` it will now throw a division by zero error. The two tests `div0_1.scm` and `div0_2.scm` will both check for this.
 
     ```
@@ -236,3 +268,235 @@ The next phase can be split into 4 smaller phases which prepare the input for th
     tal@Tals-MacBook-Pro$ ./div0_2
     library run-time error: Division by 0
     ```
+
+3. Too many arguments on lambda with default parameters
+
+    When desugaring lambda with default parameters we made them into variadic lambdas which would then parse the argument list to see whether to use the default values or ones passed in. The list was never checked for whether extra arguments were passed in. By adding a null? check on the end of the list I was able to throw an exception at the top-level stage.
+
+    ```
+    tal@Tals-MacBook-Pro$ cat tests/public/variadicApply_0.scm
+    (define f (lambda (x y z (d 1) (e 4)) (+ x y z d)))
+    (f 1 2 3 4 5 6)
+    tal@Tals-MacBook-Pro$ racket make.rkt -o varApply_0 tests/public/variadicApply_0.scm
+    tal@Tals-MacBook-Pro$ ./varApply_0
+    "Library run-time error: Too many arguments applied to default lambda"
+    ```
+
+    Doesn't fail with correct amount of arguments
+    ```
+    tal@Tals-MacBook-Pro$ cat tests/public/variadicApply_1.scm
+    (define f (lambda (x y z (d 1) (e 4) (g 5)) (+ x y z d e g)))
+    (f 1 2 3 4 5 6)
+    tal@Tals-MacBook-Pro$ racket make.rkt -o varApply_1 tests/public/variadicApply_1.scm
+    tal@Tals-MacBook-Pro$ ./varApply_1
+    21
+    ```
+
+4. No such key
+
+    When trying to do a hash lookup on a key which does not exist, throws a run time error that the key does not exist.
+
+    ```
+    tal@Tals-MacBook-Pro$ cat tests/public/noKey_1.scm
+    (define h (make-hash))
+    (hash-ref h "foo")
+    tal@Tals-MacBook-Pro$ racket make.rkt -o noKey1 tests/public/noKey_1.scm
+    tal@Tals-MacBook-Pro$ ./noKey1
+    key given:
+    "foo"
+    library run-time error: No such key found
+    ```
+
+    ```
+    tal@Tals-MacBook-Pro$ cat tests/public/noKey_2.scm
+    (define h (make-hash))
+    (hash-set! h 'foo 4)
+    (hash-ref h "foo")
+    tal@Tals-MacBook-Pro$ racket make.rkt -o noKey2 tests/public/noKey_2.scm
+    tal@Tals-MacBook-Pro$ ./noKey2
+    key given:
+    "foo"
+    library run-time error: No such key found
+    ```
+
+5. Recursive data structure
+
+    If you look at the following code example, h is a hash which we store as the only element of a vector. We then set an arbitrary key in that hash to be that vector. This creates a looping data structure which we can not print out without some extra effort.
+
+    ```
+    (define h (make-hash))
+    (define v (make-vector 1 h))
+    (hash-set! h 1 v)
+    h
+    ```
+
+    racket will evaluate this to `#0='#hash((1 . #(#0#)))`
+
+    Our program will throw a `recursive data structure detected` error if it exceeds a depth of 1000 on traversal.
+
+    ```
+    tal@Tals-MacBook-Pro$ racket make.rkt -o infStruct tests/public/infStruct.scm
+    tal@Tals-MacBook-Pro$ ./infStruct
+    library run-time error: Recursive data structure detected.
+    ```
+# 5. Hash tables
+
+Hash tables are implemented using c++ library std::unordered_map template. Two new methods have been implemented to do the heavy lifting of finding equal values. The function `bool data_equal(u64, u64)`, which returns true if two values (in our language) are equal. Additionally there is the function `std::size_t hash_data(u64)` which computes the hash value for a value in our language. If two values are equal under `data_equal` then the output of `hash_data` will be the same for them.
+
+With these methods in place we write a struct named `Key` which stores a u64 value.
+
+```
+struct Key
+{
+  u64 m_key;
+
+  bool operator==(const Key &other) const
+  {
+    u64 o_key = other.m_key;
+    return data_equal(m_key, o_key);
+  }
+};
+```
+
+The `operator==` is overloaded to extract the u64 value from the other Key and then delegates to `data_equal` to do the actual computation.
+
+With our Key data structure in place we define a hash template on this key as follows:
+
+```
+namespace std {
+
+  template <>
+  struct hash<Key>
+  {
+    std::size_t operator()(const Key& k) const
+    {
+      return hash_data(k.m_key);
+    }
+  };
+
+}
+```
+
+Once again we overload the operator()(Key) and then have it delegate to the hash_data function.
+
+Having implemented `data_equal` for the hash table, I also switched `prim_eqv` to use this function to actually compare values in the language. Unfortunately the function does not handle looping structures like racket does, and will indefinitely follow pointers. Currently the hard cap is 1000 on how deep to traverse a structure.
+
+The actual prim functions for interacting with the hash can be found at the bottom of `header.cpp`.
+
+1. **make-hash**
+
+Similar to vectors, a hash is a tuple of u64 pointers with the first value storing the tag for hashes (instead of vectors). The second value is a casted pointer to the data structure itself.
+```
+//creates an empty hash
+u64 prim_make_45hash(){
+
+    std::unordered_map<Key, u64> *hashMap;
+    hashMap = new std::unordered_map<Key, u64>();
+
+    //printf("hashmap = %llu\n", hashMap);
+    u64* ret = (u64*)alloc(2 * sizeof(u64));
+    ret[0] = HASH_OTHERTAG;
+    ret[1] = (u64)(hashMap); // there is no way this is safe
+
+    return ENCODE_OTHER(ret);
+}
+```
+2. **hash-set**
+
+Originally I was trying to initialize hashMap to be an unordered_map instead of a pointer to one. This causes c++ to create a copy of the hash and promptly stack dump as it does not want to allocate this memory.
+```
+//supported key types
+//int, symbol, string, cons, vector, hash ?
+u64 prim_hash_45set_33(u64 h, u64 k, u64 v){
+    ASSERT_TAG(h, OTHER_TAG, "First argument to hash_set must be a hash");
+
+    if( (((u64*)DECODE_OTHER(h))[0])  != HASH_OTHERTAG){
+        fatal_err("hash-set not given a proper hash");
+    }
+
+    u64 hashPtr = ((u64*)DECODE_OTHER(h))[1];
+    std::unordered_map<Key, u64> *hashMap = ((std::unordered_map<Key, u64>*) hashPtr);
+    //printf("hashmap = %llu\n", hashMap);
+
+    Key m_key = {k};
+    (*hashMap)[m_key] = v;
+    return V_VOID;
+}
+```
+
+3. **hash-ref**
+
+Currently if there is no key found it will just throw an error since it is not clear what the expression should evaluate to. Would also be useful to provide a primitive function to check for existence of keys in the hash.
+```
+u64 prim_hash_45ref(u64 h, u64 k){
+    ASSERT_TAG(h, OTHER_TAG, "First argument to hash-ref must be a hash");
+    if( (((u64*)DECODE_OTHER(h))[0])  != HASH_OTHERTAG){
+        fatal_err("hash-ref not given a proper hash");
+    }
+
+
+    u64 hashPtr = ((u64*)DECODE_OTHER(h))[1];
+    std::unordered_map<Key, u64> *hashMap = ((std::unordered_map<Key, u64>*) hashPtr);
+    Key m_key = {k};
+
+
+    if((*hashMap).count(m_key) == 0){
+        printf("key given: \n");
+        prim_print(k);
+        printf("\n");
+        fatal_err("No such key found");
+    }
+    return (*hashMap)[m_key];
+}
+```
+
+
+## Hash Table tests
+
+Here are a few tests which test the features of hash tables:
+
+### `make-hash.scm`:
+
+```
+racket make.rkt -o make-hash tests/public/make-hash.scm
+```
+
+This tests the 3 primitive functions and tests printing out the hash map. Note that this may not pass `tests.rkt` since the order of pairs is undefined between racket and c++.
+
+```
+(define h (make-hash))
+(hash-set! h 3 4)
+(hash-set! h "world" 'henlo)
+(hash-set! h 'henlo "world")
+(list (hash-ref h 3) (hash-ref h "world") (hash-ref h 'henlo) h)
+```
+#### Output:
+
+```
+'(4 . (henlo . ("world" . (#hash((henlo . "world") ("world" . henlo) (3 . 4)) . ()))))
+```
+
+### `hash-equal.scm` :
+
+```
+racket make.rkt -o hash-equal tests/public/hash-equal.scm
+```
+ Tests equivalency between hash tables with the same keys in them by `eqv?`. Note that h1 and h2 are `eqv` but not `eq`.
+
+```
+(define h1 (make-hash))
+(define h2 (make-hash))
+(define h3 (make-hash))
+
+(hash-set! h1 "hello" 'world)
+(hash-set! h2 "hello" 'world)
+(hash-set! h3 "hello" "world")
+
+(list (eq? h1 h2) h1 h2 (eq? 1 2) (eqv? 1 1) (eqv? h1 h2) (eqv? h1 h3))
+```
+
+#### Output:
+
+```
+ '(#f . (#hash(("hello" . world)) . (#hash(("hello" . world)) . (#f . (#t . (#t . (#f . ())))))))
+ ```

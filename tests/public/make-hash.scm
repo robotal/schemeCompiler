@@ -1,0 +1,5 @@
+(define h (make-hash))
+(hash-set! h 3 4)
+(hash-set! h "world" 'henlo)
+(hash-set! h 'henlo "world")
+(list (hash-ref h 3) (hash-ref h "world") (hash-ref h 'henlo) h)
